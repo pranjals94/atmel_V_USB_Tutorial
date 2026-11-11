@@ -1,0 +1,255 @@
+// V-Usb Uses the highest priority interrupt ie INT0
+
+#define F_CPU 16000000UL
+
+#include <avr/io.h>
+#include <avr/interrupt.h>
+#include <avr/wdt.h>
+#include <util/delay.h>
+#include <avr/pgmspace.h>
+#include <string.h>
+
+#include "usbdrv.h"
+#include "oddebug.h"
+
+#define REPORT_SIZE       128
+#define ADC_SAMPLES       1764
+#define CHUNK_DATA_SIZE   126
+#define NUM_CHUNKS        (ADC_SAMPLES / CHUNK_DATA_SIZE)
+
+/* HID Feature Report descriptor */
+PROGMEM const char usbHidReportDescriptor[23] = {
+	0x06, 0x00, 0xFF,       // Usage Page (Vendor Defined)
+	0x09, 0x01,             // Usage
+	0xA1, 0x01,             // Collection (Application)
+	0x15, 0x00,             // Logical Minimum (0)
+	0x26, 0xFF, 0x00,       // Logical Maximum (255)
+	0x75, 0x08,             // Report Size (8 bits)
+	0x95, 0x80,             // Report Count (128 bytes)
+	0x09, 0x00,             // Usage
+	0xB2, 0x02, 0x01,       // Feature (Buffered Bytes)
+	0xC0                    // End Collection
+};
+
+static uchar reportBuffer[REPORT_SIZE];
+static uchar currentAddress;
+static uchar bytesRemaining;
+
+static uint8_t adcSamples[ADC_SAMPLES];
+
+static volatile uint8_t RXdataReady = 0;
+static volatile uint8_t adcDataReady = 0;
+static volatile uint8_t adcCapturing = 0;
+static uint16_t adcIndex = 0;
+static volatile uint8_t requestedChunk = 0;
+
+/* Receive a Feature Report from the PC */
+uchar usbFunctionWrite(uchar *data, uchar len)
+{
+	if (len > bytesRemaining)
+	len = bytesRemaining;
+
+	memcpy(&reportBuffer[currentAddress], data, len);
+
+	currentAddress += len;
+	bytesRemaining -= len;
+
+	if (bytesRemaining == 0)
+	{
+		RXdataReady = 1;
+		return 1;
+	}
+
+	return 0;
+}
+
+/* Send a Feature Report to the PC */
+uchar usbFunctionRead(uchar *data, uchar len)
+{
+	if (len > bytesRemaining)
+	len = bytesRemaining;
+
+	memcpy(data, &reportBuffer[currentAddress], len);
+
+	currentAddress += len;
+	bytesRemaining -= len;
+
+	return len;
+}
+//-------------------------------------------------------------------------
+/* Handle HID GET_REPORT and SET_REPORT */
+usbMsgLen_t usbFunctionSetup(uchar data[8])
+{
+	usbRequest_t *rq = (void *)data;
+
+	if ((rq->bmRequestType & USBRQ_TYPE_MASK) != USBRQ_TYPE_CLASS)
+	return 0;
+
+	if (rq->wValue.bytes[1] != 3)
+	return 0;
+
+	// PC requests a Feature Report
+	if (rq->bRequest == USBRQ_HID_GET_REPORT)
+	{
+		memset(reportBuffer, 0, REPORT_SIZE);
+
+		// Byte 0: acquisition status
+		reportBuffer[0] = adcDataReady ? 1 : 0;
+
+		// Byte 1: chunk index
+		reportBuffer[1] = requestedChunk;
+
+		if (adcDataReady && requestedChunk < NUM_CHUNKS)
+		{
+			uint16_t offset =
+			(uint16_t)requestedChunk * CHUNK_DATA_SIZE;
+
+			memcpy(&reportBuffer[2],
+			&adcSamples[offset],
+			CHUNK_DATA_SIZE);
+		}
+
+		currentAddress = 0;
+		bytesRemaining = REPORT_SIZE;
+
+		return USB_NO_MSG;
+	}
+
+	// PC sends a Feature Report
+	if (rq->bRequest == USBRQ_HID_SET_REPORT)
+	{
+		currentAddress = 0;
+		bytesRemaining = REPORT_SIZE;
+
+		return USB_NO_MSG;
+	}
+
+	return 0;
+}
+//-----------------------------------
+static void adcInit(void)
+{
+	// AVcc reference, ADC0 (PC0), left-adjust result
+	ADMUX = (1 << REFS0) | (1 << ADLAR);
+
+	// ADC clock = 16 MHz / 16 = 1 MHz
+	// Enable ADC and ADC-complete interrupt
+	ADCSRA = (1 << ADEN)
+	| (1 << ADIE)
+	| (1 << ADPS2);
+}
+
+ISR(ADC_vect)
+{
+	// Read the upper 8 bits of the ADC result
+	adcSamples[adcIndex] = ADCH;
+	adcIndex++;
+
+	if (adcIndex >= ADC_SAMPLES)
+	{
+		// Capture complete
+		adcCapturing = 0;
+		adcDataReady = 1;
+
+		// Stop ADC interrupts until the next capture
+		ADCSRA &= ~(1 << ADIE);
+	}
+	else
+	{
+		// Start the next conversion
+		ADCSRA |= (1 << ADSC);
+	}
+}
+
+//----------------------------------
+static void startAdcCapture(void)
+{
+	uint8_t oldSREG = SREG;
+	cli();
+
+	if (!adcCapturing)
+	{
+		adcDataReady = 0;
+		adcIndex = 0;
+		adcCapturing = 1;
+
+		// Clear any pending ADC interrupt flag
+		ADCSRA |= (1 << ADIF);
+
+		// Enable ADC interrupt
+		ADCSRA |= (1 << ADIE);
+
+		// Start the first conversion
+		ADCSRA |= (1 << ADSC);
+	}
+
+	SREG = oldSREG;
+}
+//-----------------------------------------------------------
+void processCommand(void)
+{
+	switch (reportBuffer[0])
+	{
+		case 1:
+		// Start a new ADC capture
+		startAdcCapture();
+		requestedChunk = 0;
+		break;
+
+		case 2:
+		// Select the ADC chunk to transmit
+		if (adcDataReady &&
+		reportBuffer[1] < NUM_CHUNKS)
+		{
+			requestedChunk = reportBuffer[1];
+		}
+		break;
+
+		case 3:
+		// Toggle LED on PB0
+		PORTB ^= (1 << PB0);
+		break;
+
+		default:
+		break;
+	}
+}
+//------------------------------------------------------------------------
+int main(void)
+{
+	DDRB |=(1<<PB0);
+	uchar i;
+
+	wdt_enable(WDTO_1S);
+	odDebugInit();
+	usbInit();
+	adcInit();
+
+	cli();
+	usbDeviceDisconnect();
+
+	i = 0;
+	while (--i) {
+		wdt_reset();
+		_delay_ms(1);
+	}
+
+	usbDeviceConnect();
+	sei();
+
+	for (;;) {
+		wdt_reset();
+		usbPoll();
+		
+		/* Other short processing here */
+		if (RXdataReady)
+		{
+		 /* Prevent USB callback from changing the flag
+			while the main loop consumes it. */
+			cli();
+			RXdataReady = 0;
+			sei();
+			processCommand();
+		}
+	}
+}

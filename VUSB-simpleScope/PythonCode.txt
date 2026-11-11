@@ -1,0 +1,133 @@
+
+import hid
+import time
+import numpy as np
+import matplotlib.pyplot as plt
+
+VID = 0x16C0
+PID = 0x05DF
+
+REPORT_SIZE = 128
+ADC_SAMPLES = 1764
+CHUNK_DATA_SIZE = 126
+NUM_CHUNKS = ADC_SAMPLES // CHUNK_DATA_SIZE
+
+#Command 1: start ADC acquisition
+command = 1
+
+device = hid.device()
+
+try:
+    device.open(VID, PID)
+    print("Connected to ATmega328P V-USB HID device")
+
+    # Command
+    tx_data = bytearray(REPORT_SIZE)
+    tx_data[0] = command
+
+    tx_report = bytes([0]) + tx_data
+    written = device.send_feature_report(tx_report)
+
+    print("Command sent, bytes accepted:", written)
+
+    # Wait until ADC acquisition is complete
+    timeout = 5.0
+    start_time = time.monotonic()
+
+    while True:
+        rx_report = device.get_feature_report(
+            0, REPORT_SIZE + 1
+        )
+
+        if len(rx_report) == REPORT_SIZE + 1:
+            rx_data = bytes(rx_report[1:])
+        elif len(rx_report) == REPORT_SIZE:
+            rx_data = bytes(rx_report)
+        else:
+            raise RuntimeError(
+                f"Unexpected report length: {len(rx_report)} bytes"
+            )
+
+        if rx_data[0] == 1:
+            print("ADC acquisition complete!")
+            break
+
+        if time.monotonic() - start_time > timeout:
+            raise TimeoutError("ADC data was not ready within timeout")
+
+        time.sleep(0.005)
+
+    # Read all 1260 samples in 10 chunks
+    adc_data = []
+
+    for chunk in range(NUM_CHUNKS):
+        # Command 2: select the chunk to read
+        tx_data = bytearray(REPORT_SIZE)
+        tx_data[0] = 2
+        tx_data[1] = chunk
+
+        written = device.send_feature_report(bytes([0]) + tx_data)
+
+        if written < REPORT_SIZE:
+            raise RuntimeError(f"Short write: {written} bytes")
+
+        rx_report = device.get_feature_report(
+            0, REPORT_SIZE + 1
+        )
+
+        if len(rx_report) == REPORT_SIZE + 1:
+            rx_data = bytes(rx_report[1:])
+        elif len(rx_report) == REPORT_SIZE:
+            rx_data = bytes(rx_report)
+        else:
+            raise RuntimeError(
+                f"Unexpected report length: {len(rx_report)} bytes"
+            )
+
+        if rx_data[0] != 1:
+            raise RuntimeError(f"ADC data not ready for chunk {chunk}")
+
+        if rx_data[1] != chunk:
+            raise RuntimeError(
+                f"Expected chunk {chunk}, got {rx_data[1]}"
+            )
+
+        adc_data.extend(rx_data[2:2 + CHUNK_DATA_SIZE])
+
+        print(
+            f"Chunk {chunk + 1}/{NUM_CHUNKS}: "
+            f"{len(adc_data)}/{ADC_SAMPLES} samples"
+        )
+
+    print("\nADC data received successfully!")
+    print("Total samples:", len(adc_data))
+    print("ADC samples:", adc_data)
+
+
+    SAMPLE_INTERVAL = 104e-6  # 104 microseconds
+
+    if len(adc_data) != ADC_SAMPLES:
+        raise ValueError(
+            f"Expected {ADC_SAMPLES} samples, got {len(adc_data)}"
+        )
+
+    # Time axis in milliseconds
+    time_ms = np.arange(ADC_SAMPLES) * SAMPLE_INTERVAL * 1000
+
+    # Plot ADC values against time
+    plt.figure(figsize=(12, 5))
+    plt.plot(time_ms, adc_data, linewidth=1)
+
+    plt.title("ATmega328P ADC Samples vs Time")
+    plt.xlabel("Time (ms)")
+    plt.ylabel("ADC Value (8-bit)")
+    plt.ylim(0, 255)
+    plt.xlim(0, time_ms[-1])
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+
+
+finally:
+    device.close()
