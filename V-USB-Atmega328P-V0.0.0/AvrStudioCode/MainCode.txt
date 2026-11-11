@@ -1,0 +1,182 @@
+// V-Usb Uses the highest priority interrupt ie INT0
+
+#define F_CPU 16000000UL
+
+#include <avr/io.h>
+#include <avr/interrupt.h>
+#include <avr/wdt.h>
+#include <util/delay.h>
+#include <avr/pgmspace.h>
+#include <string.h>
+
+#include "usbdrv.h"
+#include "oddebug.h"
+
+#define REPORT_SIZE 128
+
+/* HID Feature Report descriptor */
+PROGMEM const char usbHidReportDescriptor[23] = {
+	0x06, 0x00, 0xFF,       // Usage Page (Vendor Defined)
+	0x09, 0x01,             // Usage
+	0xA1, 0x01,             // Collection (Application)
+	0x15, 0x00,             // Logical Minimum (0)
+	0x26, 0xFF, 0x00,       // Logical Maximum (255)
+	0x75, 0x08,             // Report Size (8 bits)
+	0x95, 0x80,             // Report Count (128 bytes)
+	0x09, 0x00,             // Usage
+	0xB2, 0x02, 0x01,       // Feature (Buffered Bytes)
+	0xC0                    // End Collection
+};
+
+static uchar reportBuffer[REPORT_SIZE];
+static uchar currentAddress;
+static uchar bytesRemaining;
+
+/* Number to send to the PC */
+static uint8_t numberToSend = 1;
+
+/* Prepare the report buffer */
+static void prepareReport(uint32_t numberToSend)
+{
+	memset(reportBuffer, 0, REPORT_SIZE);
+
+	/* 32-bit integer, little-endian */
+	reportBuffer[0] = (uchar)(numberToSend & 0xFF);
+	reportBuffer[1] = (uchar)((numberToSend >> 8) & 0xFF);
+	reportBuffer[2] = (uchar)((numberToSend >> 16) & 0xFF);
+	reportBuffer[3] = (uchar)((numberToSend >> 24) & 0xFF);
+}
+
+/* Receive a Feature Report from the PC */
+uchar usbFunctionWrite(uchar *data, uchar len)
+{
+	if (len > bytesRemaining)
+	len = bytesRemaining;
+
+	memcpy(&reportBuffer[currentAddress], data, len);
+
+	currentAddress += len;
+	bytesRemaining -= len;
+
+	return (bytesRemaining == 0);
+}
+
+/* Send a Feature Report to the PC */
+uchar usbFunctionRead(uchar *data, uchar len)
+{
+	if (len > bytesRemaining)
+	len = bytesRemaining;
+
+	memcpy(data, &reportBuffer[currentAddress], len);
+
+	currentAddress += len;
+	bytesRemaining -= len;
+
+	return len;
+}
+
+/* Handle HID GET_REPORT and SET_REPORT */
+usbMsgLen_t usbFunctionSetup(uchar data[8])
+{
+	usbRequest_t *rq = (void *)data;
+
+	if ((rq->bmRequestType & USBRQ_TYPE_MASK) != USBRQ_TYPE_CLASS)
+	return 0;
+
+	if (rq->bRequest == USBRQ_HID_GET_REPORT) {
+		/* Feature report type = 3 */
+		if (rq->wValue.bytes[1] != 3)
+		return 0;
+
+		prepareReport(numberToSend);
+
+		currentAddress = 0;
+		bytesRemaining = REPORT_SIZE;
+
+		return USB_NO_MSG;
+	}
+
+	if (rq->bRequest == USBRQ_HID_SET_REPORT) {
+		if (rq->wValue.bytes[1] != 3)
+		return 0;
+
+		currentAddress = 0;
+		bytesRemaining = REPORT_SIZE;
+
+		return USB_NO_MSG;
+	}
+
+	return 0;
+}
+
+/* =========================================================
+   TIMER1 -> 1 ms TIME BASE
+   ATmega8 @ 16 MHz
+
+   16 MHz / 64 = 250 kHz
+   250 kHz / 250 = 1000 Hz
+   1000 Hz = 1 ms
+   ========================================================= */
+
+void Timer1_Init(void)
+{
+    /* CTC mode */
+    TCCR1B |= (1 << WGM12);
+
+    /* Prescaler = no */
+    TCCR1B |=  (1<<CS12)|(1 << CS10);
+
+    /* 250 timer counts = 1 ms */
+    OCR1A = 65535;
+
+    /* Enable Timer1 Compare A interrupt */
+    TIMSK1 |= (1 << OCIE1A);
+
+    /* Enable global interrupts */
+    sei();
+}
+
+
+/* =========================================================
+   TIMER1 COMPARE A ISR
+   ========================================================= */
+
+ISR(TIMER1_COMPA_vect)
+{
+	PORTB ^=(1<<PB0);
+}
+
+int main(void)
+{
+	DDRB |=(1<<PB0);
+	uchar i;
+
+	wdt_enable(WDTO_1S);
+	Timer1_Init();
+
+	prepareReport(numberToSend);
+
+	odDebugInit();
+	usbInit();
+
+	cli();
+	usbDeviceDisconnect();
+
+	i = 0;
+	while (--i) {
+		wdt_reset();
+		_delay_ms(1);
+	}
+
+	usbDeviceConnect();
+	sei();
+
+
+	for (;;) {// try to multi task using timer interrupt
+		wdt_reset();
+		usbPoll();
+		
+		//processing codes here, keep it as short as possible as usb needs to keep polling 
+		prepareReport(numberToSend++);
+	}
+}

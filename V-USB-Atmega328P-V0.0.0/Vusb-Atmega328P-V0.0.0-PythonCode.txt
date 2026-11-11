@@ -1,0 +1,43 @@
+
+import hid
+
+VID = 0x16C0
+PID = 0x05DF
+REPORT_SIZE = 128
+
+device = hid.device()
+
+try:
+    device.open(VID, PID)
+    print("Connected to ATmega328P V-USB HID device")
+
+    # Prepare 128 bytes: 0, 1, 2, ... 127
+    tx_data = bytes(i & 0xFF for i in range(REPORT_SIZE))
+
+    # HIDAPI expects the report ID as the first byte.
+    # This descriptor does not use report IDs, so use ID 0.
+    tx_report = bytes([0]) + tx_data
+
+    written = device.send_feature_report(tx_report)
+    print("Bytes accepted by HIDAPI:", written)
+
+    # Read a 128-byte feature report (plus report ID byte).
+    rx_report = device.get_feature_report(0, REPORT_SIZE + 1)
+
+    if len(rx_report) < REPORT_SIZE + 1:
+        raise RuntimeError(
+            f"Short report received: {len(rx_report)} bytes"
+        )
+
+    rx_data = bytes(rx_report[1:REPORT_SIZE + 1])
+
+    print("Received data:")
+    print(list(rx_data))
+
+    if rx_data == tx_data:
+        print("SUCCESS: Sent and received data match!")
+    else:
+        print("ERROR: Received data differs from sent data.")
+
+finally:
+        device.close()
